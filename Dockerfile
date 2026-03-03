@@ -21,12 +21,10 @@ RUN corepack enable
 WORKDIR /openclaw
 
 # Pin to a known-good ref (tag/branch). Override in Railway template settings if needed.
-# Using a released tag avoids build breakage when `main` temporarily references unpublished packages.
 ARG OPENCLAW_GIT_REF=v2026.2.9
 RUN git clone --depth 1 --branch "${OPENCLAW_GIT_REF}" https://github.com/openclaw/openclaw.git .
 
 # Patch: relax version requirements for packages that may reference unpublished versions.
-# Apply to all extension package.json files to handle workspace protocol (workspace:*).
 RUN set -eux; \
   find ./extensions -name 'package.json' -type f | while read -r f; do \
     sed -i -E 's/"openclaw"[[:space:]]*:[[:space:]]*">=[^"]+"/"openclaw": "*"/g' "$f"; \
@@ -37,6 +35,24 @@ RUN pnpm install --no-frozen-lockfile
 RUN pnpm build
 ENV OPENCLAW_PREFER_PNPM=1
 RUN pnpm ui:install && pnpm ui:build
+
+
+# ── Build gog (gogcli) from source ─────────────────────────────────
+FROM golang:1.25-bookworm AS gog-build
+
+RUN apt-get update \
+  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    git \
+    ca-certificates \
+    make \
+  && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /gogcli
+
+ARG GOG_GIT_REF=v0.11.0
+RUN git clone --depth 1 --branch "${GOG_GIT_REF}" https://github.com/steipete/gogcli.git .
+RUN make
+# ────────────────────────────────────────────────────────────────────
 
 
 # Runtime image
@@ -55,8 +71,6 @@ RUN apt-get update \
 RUN corepack enable && corepack prepare pnpm@10.23.0 --activate
 
 # Persist user-installed tools by default by targeting the Railway volume.
-# - npm global installs -> /data/npm
-# - pnpm global installs -> /data/pnpm (binaries) + /data/pnpm-store (store)
 ENV NPM_CONFIG_PREFIX=/data/npm
 ENV NPM_CONFIG_CACHE=/data/npm-cache
 ENV PNPM_HOME=/data/pnpm
@@ -71,6 +85,20 @@ RUN npm install --omit=dev && npm cache clean --force
 
 # Copy built openclaw
 COPY --from=openclaw-build /openclaw /openclaw
+
+# ── Install gog binary ──────────────────────────────────────────────
+COPY --from=gog-build /gogcli/bin/gog /usr/local/bin/gog
+
+# gog stores config/tokens under XDG paths; point them at the Railway
+# volume so OAuth tokens persist across deploys.
+ENV XDG_CONFIG_HOME=/data/config
+ENV XDG_DATA_HOME=/data/local/share
+
+# On headless Linux without a desktop keyring, tell gog to use its
+# encrypted on-disk keyring. Set GOG_KEYRING_PASSWORD at runtime in
+# Railway env vars to unlock it non-interactively.
+ENV GOG_KEYRING_BACKEND=file
+# ────────────────────────────────────────────────────────────────────
 
 # Provide an openclaw executable
 RUN printf '%s\n' '#!/usr/bin/env bash' 'exec node /openclaw/dist/entry.js "$@"' > /usr/local/bin/openclaw \
